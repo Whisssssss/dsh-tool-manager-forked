@@ -8,6 +8,7 @@
 ### Fixed
 
 - 修复上游 issue #1：新建会话后**先切换 Agent 预设、再更换模型**，该会话**首轮模型请求仍携带全量工具 schema**（包括被 `disabled` 显式关闭的工具与全部按需组工具），从第二轮才恢复为策略裁剪后的视图，中间由 core 生成一批 tool-removal developer message。根因是插件把策略安装绑在 `agent/created` 的一次性快照上：若此刻 `tools` 服务尚不可读则直接放弃 attach（且永不重试），若 baseline 或 Preset 配对该刻为空/过期则 deny 集合为空；而 DSH 的 `preStep()` 先执行 `systemPrompt.assemble()` 再走 `agent/pre-step` waterfall，首请求的工具面已经固定，`agent/pre-step` 的兜底安装只能救回下一轮。现在 `install()` 不再因 tools 暂不可读而放弃 attach；`system-prompt/assemble` 过滤器改用**本次请求的真实工具面**计算 deny（不再依赖 created 时刻的 baseline），并在请求面出现 baseline 之外的名字时采用请求面作为 baseline 并重新应用 restriction/guard（只扩不缩，避免隐藏与恢复之间振荡）。
+- 修复上述修复引入的致命回归：在 `system-prompt/assemble` 过滤器里同步调用 `tools.restrict()` 会立即发出 `tools/change`，而 DSH 的 `ptcOnly` 监听器会在 `tools/change` 中重新调用 `systemPrompt.assemble()`，形成**无限递归**；每次递归都重算并深拷贝全部工具 schema，事件循环被占满，表现为设置页「工具管理」一直加载、其它插件（如 session-delete）与页面一起卡死、Host 最终崩溃。现在 baseline 自愈只更新内存状态，registry 级 restriction 推迟一个 tick（`setImmediate`）应用；首轮工具面仍由本次请求的过滤结果裁剪，`restrict()` 不再从 assemble waterfall 内触发。
 
 ## [1.2.10] - 2026-10-08
 

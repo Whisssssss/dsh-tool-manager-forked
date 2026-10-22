@@ -34,6 +34,8 @@ interface AgentState {
   restriction?: () => void;
   guard?: () => void;
   assemblyFilter?: () => void;
+  /** One deferred reconcile per adopted request surface. */
+  adoptQueued?: boolean;
   readonly exposures: Set<string>;
 }
 
@@ -233,7 +235,19 @@ export class ToolPolicyRuntime {
     state.baselineSchemas = [...schemas];
     this.observe(state);
     this.ensureGuard(state);
-    this.reconcile(state);
+    // Never call reconcile() (and therefore tools.restrict()) from inside the
+    // assemble waterfall. restrict() emits tools/change synchronously, and a
+    // tools/change listener may re-enter systemPrompt.assemble() — that loop
+    // never yields, pegs the event loop, and takes the whole Host down. The
+    // request itself is already filtered from `names`; the registry-level
+    // restriction can land one tick later.
+    if (state.adoptQueued === true) return;
+    state.adoptQueued = true;
+    setImmediate(() => {
+      state.adoptQueued = false;
+      if (!this.states.has(state.agent)) return;
+      this.reconcile(state);
+    });
   }
 
   private queueBaselineRefresh(): void {

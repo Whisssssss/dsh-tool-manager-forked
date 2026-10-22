@@ -129,6 +129,10 @@ describe("first request honors the preset policy", () => {
     const first = await h.assemble();
     assert.deepEqual(first.tools.map((item) => item.name), EXPECTED);
     assert.deepEqual(first.sections.map((item) => item.name), EXPECTED.map((name) => "tool:" + name));
+    // restrict() is applied one tick after the request surface is adopted: it
+    // emits tools/change synchronously, and doing that inside the assemble
+    // waterfall can re-enter assemble() forever.
+    await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(h.denied.sort(), ["edit", "glob", "grep", "learn_meme", "read", "read_image", "sidebar_open", "siyuan_read", "siyuan_write", "web_fetch", "web_search", "write"].sort());
     // The dispatch-level guard is installed once the tools service appears.
     assert.ok(h.guard, "guard should be installed when tools become readable");
@@ -144,6 +148,7 @@ describe("first request honors the preset policy", () => {
 
     const first = await h.assemble();
     assert.deepEqual(first.tools.map((item) => item.name), EXPECTED);
+    await new Promise((resolve) => setImmediate(resolve));
     assert.ok(h.restrictCalls.length > 0, "restriction should be applied after the request surface is adopted");
     await h.runtime.dispose();
   });
