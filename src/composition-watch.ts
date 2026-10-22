@@ -133,7 +133,10 @@ export class CompositionWatch {
 
   private schedule(): void {
     if (this.disposed || this.timer !== undefined) return;
-    const delay = this.options.debounceMs ?? 120;
+    // One inspection per second instead of per 120 ms: each inspection reads
+    // (and deep-clones) the whole tool catalog of every live Agent, so a burst
+    // of registry events must not multiply that cost.
+    const delay = this.options.debounceMs ?? 1000;
     this.timer = setTimeout(() => {
       this.timer = undefined;
       void this.flush().catch(() => undefined);

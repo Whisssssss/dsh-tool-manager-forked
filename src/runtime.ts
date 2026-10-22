@@ -32,6 +32,10 @@ interface AgentState {
   baseline: string[];
   baselineSchemas: ToolSchemaLike[];
   restriction?: () => void;
+  /** Deny set the live restriction enforces; a matching set needs no churn. */
+  lastDeny?: string[];
+  /** Preset the baseline was sampled under; a switch invalidates that sample. */
+  lastPreset?: string;
   guard?: () => void;
   assemblyFilter?: () => void;
   readonly exposures: Set<string>;
@@ -106,6 +110,7 @@ export class ToolPolicyRuntime {
       baseline,
       baselineSchemas,
       exposures,
+      lastPreset: this.presetId(agent),
     };
     this.states.set(agent, state);
     this.observe(state);
@@ -247,22 +252,32 @@ export class ToolPolicyRuntime {
   private queueBaselineRefresh(): void {
     if (this.mutating || this.refreshQueued) return;
     this.refreshQueued = true;
-    // Tool registry changes can be emitted before asynchronous scoped plugin
-    // disposal/installation has settled (notably model-selectable subagent
-    // tools during Preset recomposition). Refresh on the next event-loop turn
-    // so the baseline is never snapshotted from that transient gap.
-    setImmediate(() => {
+    // Coalesce registry churn into one sample per window. A tools/change storm
+    // while Sessions open must not turn into one full catalog rescan per event
+    // — that is what let a few events per second become a 100% CPU loop.
+    const timer = setTimeout(() => {
       this.refreshQueued = false;
       this.refreshAllBaselines();
-    });
+    }, 250);
+    (timer as { unref?: () => void }).unref?.();
   }
 
   private refreshAllBaselines(): void {
     this.mutating = true;
     try {
       for (const state of this.states.values()) {
+        const preset = this.presetId(state.agent);
+        // A resample means dropping the live restriction first and re-applying
+        // it afterwards: two tools/change emissions per Agent per window. Only
+        // a state whose sample is missing or invalid needs that. Everything
+        // else is kept fresh by install() and adoptRequestSurface(), so an
+        // ordinary tools/change costs nothing here.
+        const needsSample = state.baseline.length === 0 || state.lastPreset !== preset;
+        if (!needsSample) continue;
+        state.lastPreset = preset;
         state.restriction?.();
         state.restriction = undefined;
+        state.lastDeny = undefined;
         const nextSchemas = this.inheritedSchemas(state.agent);
         const next = nextSchemas.map((schema) => schema.name);
         state.baselineSchemas = nextSchemas;
@@ -377,6 +392,13 @@ export class ToolPolicyRuntime {
       state.baseline,
       state.exposures,
     );
+    // Releasing and re-applying a restriction emits tools/change twice, and a
+    // tools/change listener can schedule the next refresh — so re-applying an
+    // unchanged deny turns one refresh into an endless event storm. Nothing
+    // changed means nothing to do. A missing restriction (a previous apply
+    // failed) is retried even when the deny set matches.
+    if (state.restriction !== undefined && sameNames(state.lastDeny ?? [], deny)) return;
+    state.lastDeny = [...deny];
     this.mutating = true;
     try {
       state.restriction?.();

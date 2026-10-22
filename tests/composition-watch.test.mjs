@@ -423,7 +423,9 @@ describe("plugin wiring", () => {
 
     // The plugin takes its first look at the live Session, then the mode picker
     // re-links it.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // The default debounce is one second (each inspection deep-clones every
+    // live Agent's catalog), so the first look lands inside this window.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
     agent.ctx.preset = "cordis";
     for (const listener of listeners.get("tools/change") ?? []) {
       try {
@@ -432,7 +434,7 @@ describe("plugin wiring", () => {
         // Another subscriber's business, not this test's.
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await new Promise((resolve) => setTimeout(resolve, 1100));
 
     assert.deepEqual(calls, ["minimal", "cordis"]);
     assert.equal(agent.ctx.preset, "cordis");
