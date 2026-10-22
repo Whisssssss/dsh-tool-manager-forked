@@ -86,8 +86,12 @@ export class ToolPolicyRuntime {
 
   private install(agent: AgentLike): void {
     if (this.states.has(agent)) return;
-    if (!agent.ctx.get("tools")) return;
 
+    // A Preset composition registers its tools a beat after the Agent exists.
+    // Attaching anyway — even with an empty baseline — is what puts the
+    // request-surface filter in place before the Session's first model step.
+    // Skipping the attach because the tools service is not readable yet is
+    // exactly how a first request ends up carrying every tool.
     const baselineSchemas = this.inheritedSchemas(agent);
     const baseline = baselineSchemas.map((schema) => schema.name);
     const groups = resolveActiveGroups(this.policy(agent), baseline);
@@ -161,8 +165,40 @@ export class ToolPolicyRuntime {
   }
 
   private installLocalPolicy(state: AgentState): void {
+    this.ensureGuard(state);
+    if (typeof state.agent.ctx.on !== "function") return;
+    // The request surface is the one path every model step must pass through,
+    // and DSH assembles it BEFORE the `agent/pre-step` waterfall runs — so this
+    // listener is the earliest policy hook a Session can have. A baseline
+    // captured at `agent/created` may still lack the Preset composition's tools
+    // (an empty baseline means an empty deny set), which is why the deny set is
+    // derived from the tools THIS request exposes rather than from the snapshot.
+    state.assemblyFilter = state.agent.ctx.on("system-prompt/assemble", async (...args: unknown[]) => {
+      const next = args.at(-1);
+      if (typeof next !== "function") return args[0];
+      const assembly = await (next as () => Promise<unknown>)();
+      if (!isPromptAssembly(assembly)) return assembly;
+      const names = assembly.tools.map((schema) => schema.name);
+      this.adoptRequestSurface(state, names, assembly.tools);
+      const hidden = new Set(denyNames(this.policy(state.agent), names, state.exposures));
+      if (hidden.size === 0) return assembly;
+      return {
+        ...assembly,
+        tools: assembly.tools.filter((schema) => !hidden.has(schema.name)),
+        sections: assembly.sections.filter((section) => {
+          const toolName = section.name.startsWith("tool:") ? section.name.slice("tool:".length) : undefined;
+          return toolName === undefined || !hidden.has(toolName);
+        }),
+      };
+    }) as (() => void) | undefined;
+  }
+
+  /** Install the dispatch-level guard once the Agent exposes its tools service. */
+  private ensureGuard(state: AgentState): void {
+    if (state.guard) return;
     const scopedTools = state.agent.ctx.get<ToolRuntimeLike>("tools");
-    state.guard = scopedTools?.guard?.((execution) => {
+    if (!scopedTools?.guard) return;
+    state.guard = scopedTools.guard((execution) => {
       const policy = this.policy(state.agent);
       const hidden = denyNames(policy, state.baseline, state.exposures);
       if (!hidden.includes(execution.name)) return undefined;
@@ -178,22 +214,26 @@ export class ToolPolicyRuntime {
       }
       return `tool ${JSON.stringify(execution.name)} is unavailable under the tool-manager policy for this Agent preset`;
     });
-    state.assemblyFilter = state.agent.ctx.on("system-prompt/assemble", async (...args: unknown[]) => {
-      const next = args.at(-1);
-      if (typeof next !== "function") return args[0];
-      const assembly = await (next as () => Promise<unknown>)();
-      if (!isPromptAssembly(assembly)) return assembly;
-      const hidden = new Set(denyNames(this.policy(state.agent), state.baseline, state.exposures));
-      if (hidden.size === 0) return assembly;
-      return {
-        ...assembly,
-        tools: assembly.tools.filter((schema) => !hidden.has(schema.name)),
-        sections: assembly.sections.filter((section) => {
-          const toolName = section.name.startsWith("tool:") ? section.name.slice("tool:".length) : undefined;
-          return toolName === undefined || !hidden.has(toolName);
-        }),
-      };
-    }) as (() => void) | undefined;
+  }
+
+  /**
+   * Adopt the tool surface a model request actually exposes as this Agent's
+   * baseline when the snapshot taken at `agent/created` is missing names it now
+   * has. That happens when the Preset composition registers its tools after the
+   * Agent was created, or when a dynamic source (an MCP tools/list) lands
+   * without a `tools/change`. Tools an existing restriction already denies are
+   * never a reason to shrink the baseline — doing so would oscillate — so this
+   * only fires when the request carries a name the baseline does not have.
+   */
+  private adoptRequestSurface(state: AgentState, names: string[], schemas: ToolSchemaLike[]): void {
+    if (names.length === 0) return;
+    const known = new Set(state.baseline);
+    if (names.every((name) => known.has(name))) return;
+    state.baseline = [...names];
+    state.baselineSchemas = [...schemas];
+    this.observe(state);
+    this.ensureGuard(state);
+    this.reconcile(state);
   }
 
   private queueBaselineRefresh(): void {

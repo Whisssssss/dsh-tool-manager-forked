@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 修复上游 issue #1：新建会话后**先切换 Agent 预设、再更换模型**，该会话**首轮模型请求仍携带全量工具 schema**（包括被 `disabled` 显式关闭的工具与全部按需组工具），从第二轮才恢复为策略裁剪后的视图，中间由 core 生成一批 tool-removal developer message。根因是插件把策略安装绑在 `agent/created` 的一次性快照上：若此刻 `tools` 服务尚不可读则直接放弃 attach（且永不重试），若 baseline 或 Preset 配对该刻为空/过期则 deny 集合为空；而 DSH 的 `preStep()` 先执行 `systemPrompt.assemble()` 再走 `agent/pre-step` waterfall，首请求的工具面已经固定，`agent/pre-step` 的兜底安装只能救回下一轮。现在 `install()` 不再因 tools 暂不可读而放弃 attach；`system-prompt/assemble` 过滤器改用**本次请求的真实工具面**计算 deny（不再依赖 created 时刻的 baseline），并在请求面出现 baseline 之外的名字时采用请求面作为 baseline 并重新应用 restriction/guard（只扩不缩，避免隐藏与恢复之间振荡）。
+
 ## [1.2.10] - 2026-10-08
 
 ### Fixed

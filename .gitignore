@@ -3,4 +3,5 @@ dist/
 *.log
 *.tgz
 .playwright-cli/
+.investigation/
 .DS_Store
