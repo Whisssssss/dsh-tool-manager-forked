@@ -212,10 +212,25 @@ function isGroupableTool(name: string): boolean {
   return name !== DISCOVERY_TOOL_NAME && name !== PTC_TRANSPORT_NAME;
 }
 
+/**
+ * Compiled wildcard patterns.
+ *
+ * Every model step matches one Preset's whole tool catalog against every group
+ * pattern (deny set, catalog, guard), so recompiling the same RegExp hundreds of
+ * times per step is pure overhead. Patterns are few and stable; the cache is
+ * bounded so a pathological settings file cannot grow it without limit.
+ */
+const patternCache = new Map<string, RegExp>();
+
 export function matchesPattern(value: string, pattern: string): boolean {
   if (!pattern.includes("*")) return value === pattern;
-  const escaped = pattern.replace(/[|\\{}()[\]^$+?.]/g, "\\$&").replace(/\*/g, ".*");
-  return new RegExp(`^${escaped}$`).test(value);
+  let regex = patternCache.get(pattern);
+  if (regex === undefined) {
+    const escaped = pattern.replace(/[|\\{}()[\]^$+?.]/g, "\\$&").replace(/\*/g, ".*");
+    regex = new RegExp(`^${escaped}$`);
+    if (patternCache.size < 512) patternCache.set(pattern, regex);
+  }
+  return regex.test(value);
 }
 
 export function sameNames(left: readonly string[], right: readonly string[]): boolean {

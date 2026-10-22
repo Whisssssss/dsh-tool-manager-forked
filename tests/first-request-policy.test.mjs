@@ -129,12 +129,11 @@ describe("first request honors the preset policy", () => {
     const first = await h.assemble();
     assert.deepEqual(first.tools.map((item) => item.name), EXPECTED);
     assert.deepEqual(first.sections.map((item) => item.name), EXPECTED.map((name) => "tool:" + name));
-    // restrict() is applied one tick after the request surface is adopted: it
-    // emits tools/change synchronously, and doing that inside the assemble
-    // waterfall can re-enter assemble() forever.
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(h.denied.sort(), ["edit", "glob", "grep", "learn_meme", "read", "read_image", "sidebar_open", "siyuan_read", "siyuan_write", "web_fetch", "web_search", "write"].sort());
-    // The dispatch-level guard is installed once the tools service appears.
+    // Adopting the surface deliberately does NOT re-apply restrict(): every
+    // restrict() emits tools/change, and DSH responds by recomputing and
+    // deep-cloning the whole catalog for every live Agent. Opening a Session
+    // must not pay that cost. The guard reads the adopted baseline instead.
+    assert.ok(h.guard, "guard should be installed when tools become readable");
     assert.ok(h.guard, "guard should be installed when tools become readable");
     assert.match(h.guard({ name: "edit" }), /disabled by the tool-manager policy/);
     assert.match(h.guard({ name: "web_fetch" }), /belongs to on-demand group/);
@@ -148,8 +147,8 @@ describe("first request honors the preset policy", () => {
 
     const first = await h.assemble();
     assert.deepEqual(first.tools.map((item) => item.name), EXPECTED);
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.ok(h.restrictCalls.length > 0, "restriction should be applied after the request surface is adopted");
+    assert.ok(h.guard, "guard should be installed once the tools service appears");
+    assert.match(h.guard({ name: "edit" }), /disabled by the tool-manager policy/);
     await h.runtime.dispose();
   });
 

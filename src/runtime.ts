@@ -34,8 +34,6 @@ interface AgentState {
   restriction?: () => void;
   guard?: () => void;
   assemblyFilter?: () => void;
-  /** One deferred reconcile per adopted request surface. */
-  adoptQueued?: boolean;
   readonly exposures: Set<string>;
 }
 
@@ -235,19 +233,15 @@ export class ToolPolicyRuntime {
     state.baselineSchemas = [...schemas];
     this.observe(state);
     this.ensureGuard(state);
-    // Never call reconcile() (and therefore tools.restrict()) from inside the
-    // assemble waterfall. restrict() emits tools/change synchronously, and a
-    // tools/change listener may re-enter systemPrompt.assemble() — that loop
-    // never yields, pegs the event loop, and takes the whole Host down. The
-    // request itself is already filtered from `names`; the registry-level
-    // restriction can land one tick later.
-    if (state.adoptQueued === true) return;
-    state.adoptQueued = true;
-    setImmediate(() => {
-      state.adoptQueued = false;
-      if (!this.states.has(state.agent)) return;
-      this.reconcile(state);
-    });
+    // Never call reconcile() (and therefore tools.restrict()) here.
+    // restrict() emits tools/change synchronously and its listeners re-do real
+    // work for every live Agent (DSH recomputes and deep-clones the whole tool
+    // catalog), so doing it per opened Session turns into a noticeable global
+    // slowdown — and from inside the assemble waterfall it can even re-enter
+    // assemble() forever. The request is already filtered from `names`, and the
+    // guard above now reads the adopted baseline, so neither correctness nor
+    // dispatch depends on the registry-level restriction. It is applied by the
+    // throttled refresh path on the next genuine tools/change instead.
   }
 
   private queueBaselineRefresh(): void {
