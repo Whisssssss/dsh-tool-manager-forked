@@ -126,6 +126,34 @@ dsh plugin --profile desktop remove dsh-tool-manager
 > 独占管理），要验证组合配置请改用 `dsh plugin --profile desktop list`，
 > 或直接在设置页查看。
 
+### 方式三：从源码或本地路径安装（开发者 / fork）
+
+`dist/` 是构建产物，不随仓库提供。用 `link:` 依赖或设置页的「路径安装」挂载本地目录时，
+包管理器只创建符号链接，**不会替你构建**。缺少 `dist/index.js` 时，插件会在 DSH 启动时报：
+
+```text
+failed to import: Error [ERR_MODULE_NOT_FOUND]: Cannot find module
+'...node_modules\dsh-tool-manager\dist\index.js'
+```
+
+先构建再挂载：
+
+```bash
+git clone https://github.com/Whisssssss/dsh-tool-manager-forked.git
+cd dsh-tool-manager-forked
+npm ci        # 安装依赖，并通过 prepare 自动构建
+npm run build # 显式再确认一次，生成 dist/index.js 与 dist/client.js
+```
+
+然后在 Profile 的 `package.json` 里加依赖，或直接用设置页的「路径安装」：
+
+```json
+"dsh-tool-manager": "link:D:/path/to/dsh-tool-manager-forked"
+```
+
+每次修改源码后重新 `npm run build`，再重启 DSH。**加载阶段失败（import 报错）的插件
+不会被 `dsh-hot-reload` 自动恢复**，必须重启 DSH 才能重新导入。
+
 ## 使用方法
 
 ### 1. 选择 Agent Preset
