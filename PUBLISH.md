@@ -44,6 +44,10 @@ npm run build   # tsc → dist/ + client bundle
 npm test        # node:test 全部用例
 ```
 
+> `dist/` 已纳入版本控制：ZIP、`link:`、设置页「路径安装」都不会执行构建，插件直接导入
+> 仓库里的 `dist/index.js`。**改了 `src/` 就必须重新构建并提交 `dist/`**，否则源码安装
+> 的用户会继续加载旧产物。CI 会检查 `dist/` 与重新构建结果是否一致。
+
 发布前可本地验证产物：
 
 ```bash

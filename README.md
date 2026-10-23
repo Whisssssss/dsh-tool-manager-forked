@@ -126,29 +126,34 @@ dsh plugin --profile desktop remove dsh-tool-manager
 > 独占管理），要验证组合配置请改用 `dsh plugin --profile desktop list`，
 > 或直接在设置页查看。
 
-### 方式三：从源码或本地路径安装（开发者 / fork）
+### 方式三：从源码、ZIP 或本地路径安装（开发者 / fork）
 
-`dist/` 是构建产物，不随仓库提供。用 `link:` 依赖或设置页的「路径安装」挂载本地目录时，
-包管理器只创建符号链接，**不会替你构建**。缺少 `dist/index.js` 时，插件会在 DSH 启动时报：
+`dist/` 构建产物随仓库一起提供。原因：`link:` 依赖、设置页的「路径安装」以及直接
+下载的 ZIP 目录都不会执行 `npm install`（因此也不会触发构建），只有把入口文件放进
+仓库，这些安装方式才能在 DSH 启动时正常导入。缺少 `dist/index.js` 时插件会报：
 
 ```text
 failed to import: Error [ERR_MODULE_NOT_FOUND]: Cannot find module
 '...node_modules\dsh-tool-manager\dist\index.js'
 ```
 
-先构建再挂载：
-
-```bash
-git clone https://github.com/Whisssssss/dsh-tool-manager-forked.git
-cd dsh-tool-manager-forked
-npm ci        # 安装依赖，并通过 prepare 自动构建
-npm run build # 显式再确认一次，生成 dist/index.js 与 dist/client.js
-```
-
-然后在 Profile 的 `package.json` 里加依赖，或直接用设置页的「路径安装」：
+因此，从 ZIP 解压或 `git clone` 后**不需要先构建**，直接挂载即可：
 
 ```json
 "dsh-tool-manager": "link:D:/path/to/dsh-tool-manager-forked"
+```
+
+也可以从 git 地址安装（不需要构建脚本审批，因为仓库已带 `dist/`）：
+
+```bash
+dsh plugin --profile desktop add github:Whisssssss/dsh-tool-manager-forked
+```
+
+只有修改 `src/` 后才需要重新构建，并把更新后的 `dist/` 一并提交：
+
+```bash
+npm ci
+npm run build
 ```
 
 每次修改源码后重新 `npm run build`，再重启 DSH。**加载阶段失败（import 报错）的插件
@@ -271,6 +276,10 @@ npm install
 npm run build
 npm test
 ```
+
+`dist/` 已纳入版本控制：改动 `src/` 后请运行 `npm run build` 并把 `dist/` 的变更一起提交，
+否则从源码 / ZIP / 路径安装的插件仍在使用旧的构建产物。CI 会校验提交的 `dist/` 与
+重新构建的结果是否一致。
 
 ## 许可证
 

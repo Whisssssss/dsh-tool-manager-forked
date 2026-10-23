@@ -7,6 +7,13 @@
 
 ### Fixed
 
+- 修复**从源码 / ZIP / 本地路径安装后插件无法启用**的问题：DSH 启动时报
+  `failed to import: Error [ERR_MODULE_NOT_FOUND]: Cannot find module '...\dist\index.js'`。
+  根因是 `dist/` 被 `.gitignore` 排除，而 `link:` 依赖与设置页「路径安装」由 pnpm
+  直接建立符号链接，不会执行 `npm install`，也就不会触发构建；从 GitHub 下载的 ZIP
+  同样不含构建产物。现在 `dist/` 随仓库提供，ZIP、`link:`、路径安装都能直接导入；
+  同时移除 `prepare`，避免 `github:` 安装被 pnpm 的构建脚本审批拦截（产物已在仓库中，
+  无需再构建）。CI 增加校验：重新构建后 `dist/` 必须与提交内容一致，防止产物过期。
 - 修复上游 issue #1：新建会话后**先切换 Agent 预设、再更换模型**，该会话**首轮模型请求仍携带全量工具 schema**（包括被 `disabled` 显式关闭的工具与全部按需组工具），从第二轮才恢复为策略裁剪后的视图，中间由 core 生成一批 tool-removal developer message。根因是插件把策略安装绑在 `agent/created` 的一次性快照上：若此刻 `tools` 服务尚不可读则直接放弃 attach（且永不重试），若 baseline 或 Preset 配对该刻为空/过期则 deny 集合为空；而 DSH 的 `preStep()` 先执行 `systemPrompt.assemble()` 再走 `agent/pre-step` waterfall，首请求的工具面已经固定，`agent/pre-step` 的兜底安装只能救回下一轮。现在 `install()` 不再因 tools 暂不可读而放弃 attach；`system-prompt/assemble` 过滤器改用**本次请求的真实工具面**计算 deny（不再依赖 created 时刻的 baseline），并在请求面出现 baseline 之外的名字时采用请求面作为 baseline 并重新应用 restriction/guard（只扩不缩，避免隐藏与恢复之间振荡）。
 - 修复上述修复引入的致命回归：在 `system-prompt/assemble` 过滤器里同步调用 `tools.restrict()` 会立即发出 `tools/change`，而 DSH 的 `ptcOnly` 监听器会在 `tools/change` 中重新调用 `systemPrompt.assemble()`，形成**无限递归**；每次递归都重算并深拷贝全部工具 schema，事件循环被占满，表现为设置页「工具管理」一直加载、其它插件（如 session-delete）与页面一起卡死、Host 最终崩溃。现在 baseline 自愈只更新内存状态，registry 级 restriction 交给节流刷新路径；`restrict()` 不再从 assemble waterfall 内触发。
 - 修复启用工具管理后打开/切换会话、新建会话越来越慢并最终拖垮 Host 的问题：`tools/change` 触发的 `refreshAllBaselines()` 会对每个 live Agent 释放并重新应用 `tools.restrict()`，两次调用各发一次 `tools/change`，又被下一轮刷新接收，形成自激事件风暴（实测约 60 次/秒 `tools/change`、3 次/秒全量刷新、100% CPU）；`CompositionWatch` 又在每次事件后对每个 live Agent 深拷贝全量工具 schema，把风暴放大。现在 `reconcile()` 幂等（deny 未变则不释放、不重设），基线刷新合并为 250 ms 窗口且只重采样「基线为空或 Preset 已变化」的 Agent，`CompositionWatch` 的 inspection 防抖从 120 ms 提高到 1 s。

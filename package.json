@@ -29,7 +29,6 @@
     "build": "tsc && node scripts/copy-client.mjs",
     "test": "npm run build && node --test tests/*.test.mjs",
     "test:watch": "node --test --watch tests/*.test.mjs",
-    "prepare": "npm run build",
     "prepublishOnly": "npm run build && npm test"
   },
   "devDependencies": {
