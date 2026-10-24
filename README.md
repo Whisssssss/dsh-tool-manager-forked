@@ -1,4 +1,4 @@
-# DSH 工具管理插件
+# DSH 工具管理插件123
 
 一个简单好用的 DeepSeek Harness（DSH）工具管理插件。
 
