@@ -21,11 +21,33 @@ import {
 } from "./policy.js";
 import {
   DISCOVERY_TOOL_NAME,
+  PTC_TRANSPORT_NAME,
   TOOL_MANAGER_PROBE_SESSION_ID,
   type PresetToolPolicy,
   type ToolListResult,
   type ToolManagerSettings,
 } from "./types.js";
+
+/**
+ * Retry window for sampling a baseline the Preset composition had not
+ * registered yet. The first sample runs immediately; later ones every
+ * {@link BASELINE_RECOVERY_INTERVAL_MS}, because a Session created a beat too
+ * early would otherwise carry an empty catalog for its whole life.
+ */
+const BASELINE_RECOVERY_INTERVAL_MS = 50;
+const BASELINE_RECOVERY_ATTEMPTS = 60;
+/**
+ * A Preset switch briefly unmounts its predecessor before the new composition
+ * registers, so the first samples can miss tools. After this many rejected
+ * samples the catalog is accepted as-is — a shrink is real, not a transition.
+ */
+const SAMPLE_SETTLE_ATTEMPTS = 25;
+/**
+ * Quiet window that marks a Preset switch as finished. The switch emits
+ * tools/change while it unmounts the old composition and mounts the new one; a
+ * sample taken after the churn stops sees the complete catalog.
+ */
+const PRESET_SETTLE_MS = 300;
 
 interface AgentState {
   readonly agent: AgentLike;
@@ -38,6 +60,10 @@ interface AgentState {
   lastPreset?: string;
   guard?: () => void;
   assemblyFilter?: () => void;
+  /** A retrying baseline sample is armed; later requests reuse it. */
+  recovering?: boolean;
+  /** Consecutive samples rejected as mid-transition; forces acceptance eventually. */
+  sampleRetries?: number;
   readonly exposures: Set<string>;
 }
 
@@ -46,7 +72,11 @@ export class ToolPolicyRuntime {
   private readonly states = new Map<AgentLike, AgentState>();
   private readonly observedSchemas = new Map<string, Map<string, ToolSchemaLike>>();
   private mutating = false;
+  /** Last tools/change from outside this plugin's own restriction churn. */
+  private lastToolsChangeAt = 0;
   private refreshQueued = false;
+  /** Depth of the `system-prompt/assemble` waterfall currently in flight. */
+  private assembling = 0;
   private discoveryDisposer?: () => void;
 
   constructor(
@@ -70,7 +100,12 @@ export class ToolPolicyRuntime {
       const payload = asCreated(args[0]);
       if (payload) this.uninstall(payload.agent);
     });
-    this.ctx.on("tools/change", () => this.queueBaselineRefresh());
+    this.ctx.on("tools/change", () => {
+      // Registry churn caused by this plugin's own restriction is not evidence
+      // that a Preset composition is still mounting.
+      if (!this.mutating) this.lastToolsChangeAt = Date.now();
+      this.queueBaselineRefresh();
+    });
     this.ctx.on("agent/pre-step", (...args: unknown[]) => this.onPreStep(args[0], args[1]));
   }
 
@@ -116,6 +151,12 @@ export class ToolPolicyRuntime {
     this.observe(state);
     this.installLocalPolicy(state);
     this.reconcile(state);
+    // A Preset composition registers its tools a beat after the Agent exists,
+    // and a tools/change emitted inside that window is dropped while `mutating`
+    // is set. Without this timer a Session created in that window keeps an empty
+    // baseline for its whole life — and under PTC mode nothing later corrects
+    // it, because the request surface carries only the transport.
+    if (state.baseline.length === 0) this.scheduleBaselineRecovery(state);
   }
 
   private uninstall(agent: AgentLike): void {
@@ -181,20 +222,34 @@ export class ToolPolicyRuntime {
     state.assemblyFilter = state.agent.ctx.on("system-prompt/assemble", async (...args: unknown[]) => {
       const next = args.at(-1);
       if (typeof next !== "function") return args[0];
-      const assembly = await (next as () => Promise<unknown>)();
-      if (!isPromptAssembly(assembly)) return assembly;
-      const names = assembly.tools.map((schema) => schema.name);
-      this.adoptRequestSurface(state, names, assembly.tools);
-      const hidden = new Set(denyNames(this.policy(state.agent), names, state.exposures));
-      if (hidden.size === 0) return assembly;
-      return {
-        ...assembly,
-        tools: assembly.tools.filter((schema) => !hidden.has(schema.name)),
-        sections: assembly.sections.filter((section) => {
-          const toolName = section.name.startsWith("tool:") ? section.name.slice("tool:".length) : undefined;
-          return toolName === undefined || !hidden.has(toolName);
-        }),
-      };
+      this.assembling += 1;
+      try {
+        // PTC mode collapses the request surface to the reserved transport, so
+        // the generated SDK rendered inside next() IS the catalog the model
+        // sees. Restricting after next() would be too late for the FIRST
+        // request, and the assemble-filter below can never learn the hidden
+        // names from a one-tool surface. Applying the policy before the render
+        // is the only point where a PTC request can carry it; a re-entrant
+        // assemble caused by tools/change sees the fresh baseline and only
+        // renders.
+        this.ensureRequestBaseline(state);
+        const assembly = await (next as () => Promise<unknown>)();
+        if (!isPromptAssembly(assembly)) return assembly;
+        const names = assembly.tools.map((schema) => schema.name);
+        this.adoptRequestSurface(state, names, assembly.tools);
+        const hidden = new Set(denyNames(this.policy(state.agent), names, state.exposures));
+        if (hidden.size === 0) return assembly;
+        return {
+          ...assembly,
+          tools: assembly.tools.filter((schema) => !hidden.has(schema.name)),
+          sections: assembly.sections.filter((section) => {
+            const toolName = section.name.startsWith("tool:") ? section.name.slice("tool:".length) : undefined;
+            return toolName === undefined || !hidden.has(toolName);
+          }),
+        };
+      } finally {
+        this.assembling -= 1;
+      }
     }) as (() => void) | undefined;
   }
 
@@ -226,16 +281,41 @@ export class ToolPolicyRuntime {
    * baseline when the snapshot taken at `agent/created` is missing names it now
    * has. That happens when the Preset composition registers its tools after the
    * Agent was created, or when a dynamic source (an MCP tools/list) lands
-   * without a `tools/change`. Tools an existing restriction already denies are
-   * never a reason to shrink the baseline — doing so would oscillate — so this
-   * only fires when the request carries a name the baseline does not have.
+   * without a `tools/change`.
+   *
+   * Adoption is GROW-ONLY, and that is load-bearing: while a Preset switch is
+   * still mounting, a native request surface can be observed with only a
+   * fraction of the catalog plus a few names the previous Preset lacked (PTC
+   * exposes `ops_inspect_local_file`/`ops_result`/`ops_load_sdk` where standard
+   * exposes `workflow`). Replacing the baseline with that surface would erase
+   * the catalog, leave almost nothing to deny, and — because the baseline is
+   * then non-empty and the Preset already matches — never be resampled.
    */
   private adoptRequestSurface(state: AgentState, names: string[], schemas: ToolSchemaLike[]): void {
     if (names.length === 0) return;
+    // PTC mode collapses the request surface to the reserved transport: the
+    // model may call only `run_code`, and every other tool arrives through the
+    // generated SDK. Adopting that surface would record a "catalog" of one
+    // transport name that no group can ever match — the policy would silently
+    // stop hiding anything, and `refreshAllBaselines()` would never resample it
+    // because the baseline is no longer empty. Sample the registry instead.
+    if (this.isCollapsedSurface(names)) {
+      this.scheduleBaselineRecovery(state);
+      return;
+    }
     const known = new Set(state.baseline);
     if (names.every((name) => known.has(name))) return;
-    state.baseline = [...names];
-    state.baselineSchemas = [...schemas];
+    const merged = [...state.baseline];
+    const byName = new Map(state.baselineSchemas.map((schema) => [schema.name, schema]));
+    for (const [index, name] of names.entries()) {
+      if (name === undefined || known.has(name)) continue;
+      known.add(name);
+      merged.push(name);
+      const schema = schemas[index];
+      if (schema !== undefined) byName.set(name, schema);
+    }
+    state.baseline = merged;
+    state.baselineSchemas = [...byName.values()];
     this.observe(state);
     this.ensureGuard(state);
     // Never call reconcile() (and therefore tools.restrict()) here.
@@ -247,6 +327,202 @@ export class ToolPolicyRuntime {
     // guard above now reads the adopted baseline, so neither correctness nor
     // dispatch depends on the registry-level restriction. It is applied by the
     // throttled refresh path on the next genuine tools/change instead.
+  }
+
+  /**
+   * Whether a request surface is PTC mode's collapsed transport: `run_code` is
+   * the only tool the model may call directly, and every other tool is projected
+   * into the generated SDK. Such a surface describes the presentation, never the
+   * registry, so it must not shape the baseline.
+   */
+  private isCollapsedSurface(names: readonly string[]): boolean {
+    return names.length > 0 && names.every((name) => name === PTC_TRANSPORT_NAME);
+  }
+
+  /**
+   * Whether one Agent's baseline needs a new sample: never captured, collapsed
+   * to the PTC transport, or taken under a different Preset.
+   * @param state - the Agent state to inspect.
+   * @param preset - the Agent's current Preset id.
+   * @returns whether the baseline must be resampled.
+   */
+  private baselineIsStale(
+    state: AgentState,
+    preset: string | undefined = this.presetId(state.agent),
+  ): boolean {
+    return state.baseline.length === 0
+      || this.isCollapsedSurface(state.baseline)
+      || state.lastPreset !== preset;
+  }
+
+  /**
+   * Whether the tools service presents PTC mode for this Agent.
+   *
+   * `run_code` exists in the visibility view only under a PTC presentation, so
+   * its presence is the cheapest reliable answer — and unlike `schemas()` a
+   * single lookup does not deep-clone the whole catalog on every assembly.
+   * @param agent - the Agent whose presentation to inspect.
+   * @returns whether the Agent is presented through the PTC transport.
+   */
+  private isPtcScope(agent: AgentLike): boolean {
+    const tools = agent.ctx.get<ToolRuntimeLike>("tools");
+    if (!tools) return false;
+    if (typeof tools.get === "function") {
+      try {
+        return tools.get(PTC_TRANSPORT_NAME, agent) !== undefined;
+      } catch {
+        // Older runtimes may expose get() with different semantics; fall back
+        // to the catalog projection below.
+      }
+    }
+    try {
+      return tools.schemas(agent).some((schema) => schema.name === PTC_TRANSPORT_NAME);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Whether a sample may replace the baseline.
+   *
+   * A Preset switch legitimately changes the catalog — different modes compose
+   * different tools — so "is every old name still present" cannot distinguish a
+   * mid-transition sample from a real one (standard exposes `workflow` and
+   * `ops_discover_tools`, PTC does not). Registry quiet can: the switch emits
+   * tools/change while it unmounts the old composition and mounts the new one,
+   * so a sample taken after the churn stops sees the settled catalog.
+   * @param previous - the baseline before this sample.
+   * @param previousPreset - the Preset that baseline was sampled under.
+   * @param preset - the Agent's current Preset id.
+   * @param names - the names the registry currently exposes.
+   * @returns whether the sample may replace the baseline.
+   */
+  private isSettledSample(
+    previous: readonly string[],
+    previousPreset: string | undefined,
+    preset: string | undefined,
+    names: readonly string[],
+  ): boolean {
+    if (names.length === 0) return false;
+    if (previous.length === 0 || this.isCollapsedSurface(previous)) return true;
+    if (previousPreset === preset) return true;
+    return Date.now() - this.lastToolsChangeAt >= PRESET_SETTLE_MS;
+  }
+
+  /**
+   * Resample one Agent's baseline from the registry.
+   *
+   * A live restriction is dropped first: `schemas(agent)` reads the already
+   * filtered view, so sampling under a restriction would record the hidden names
+   * as the catalog and oscillate on the next reconcile.
+   *
+   * A stale baseline is REPLACED — a Preset switch may legitimately shrink the
+   * catalog. A fresh one only GROWS when `merge` is set: a Session resumed from
+   * disk, or composed before its Preset finished mounting, samples a subset of
+   * the real catalog, and that must never erase what the baseline already holds.
+   * @param state - the Agent state to resample.
+   * @param merge - merge new tools instead of replacing when not stale.
+   * @returns whether the baseline now reflects a usable sample.
+   */
+  private resampleBaseline(state: AgentState, merge = false): boolean {
+    const preset = this.presetId(state.agent);
+    const stale = this.baselineIsStale(state, preset);
+    if (!stale && !merge) return true;
+    const previous = [...state.baseline];
+    const previousPreset = state.lastPreset;
+    this.mutating = true;
+    try {
+      state.restriction?.();
+      state.restriction = undefined;
+      state.lastDeny = undefined;
+      const schemas = this.inheritedSchemas(state.agent);
+      if (schemas.length === 0) return false;
+      const names = schemas.map((schema) => schema.name);
+      if (stale) {
+        const complete = this.isSettledSample(previous, previousPreset, preset, names);
+        const attempts = (state.sampleRetries ?? 0) + 1;
+        if (!complete && attempts <= SAMPLE_SETTLE_ATTEMPTS) {
+          state.sampleRetries = attempts;
+          return false;
+        }
+        state.sampleRetries = 0;
+        state.baseline = names;
+        state.baselineSchemas = schemas;
+        state.lastPreset = preset;
+      } else {
+        const known = new Set(previous);
+        const added = schemas.filter((schema) => !known.has(schema.name));
+        if (added.length === 0) return true;
+        const byName = new Map(state.baselineSchemas.map((schema) => [schema.name, schema]));
+        for (const schema of added) byName.set(schema.name, schema);
+        state.baseline = [...previous, ...added.map((schema) => schema.name)];
+        state.baselineSchemas = [...byName.values()];
+      }
+      this.observe(state);
+      this.ensureGuard(state);
+      return true;
+    } finally {
+      this.mutating = false;
+    }
+  }
+
+  /**
+   * Land the policy before the generated SDK is rendered.
+   *
+   * Only PTC mode needs this: its request surface carries nothing but the
+   * transport, so the assemble filter above cannot derive the hidden names. This
+   * runs before `next()`, where the SDK text is produced from the registry's
+   * current visibility, so a restriction applied here reaches the FIRST request.
+   * @param state - the Agent whose request is being assembled.
+   */
+  private ensureRequestBaseline(state: AgentState): void {
+    if (this.assembling > 1) return;
+    if (!this.isPtcScope(state.agent)) return;
+    if (!this.baselineIsStale(state)) return;
+    try {
+      const accepted = this.resampleBaseline(state);
+      this.reconcile(state);
+      if (!accepted) this.scheduleBaselineRecovery(state);
+    } catch {
+      // The request must render even when recovery fails; the next assemble retries.
+    }
+  }
+
+  /**
+   * Recover a missing, collapsed, or stale baseline on a short timer.
+   *
+   * It must not run inside the `system-prompt/assemble` waterfall: applying the
+   * restriction there emits `tools/change`, which makes DSH re-assemble the
+   * prompt for PTC mode and recurse. A timer is also exactly the window the
+   * Preset composition needs to register its tools after `agent/created`.
+   * @param state - the Agent state whose baseline needs a sample.
+   * @param attempt - retry index; the first attempt runs on the next tick.
+   */
+  private scheduleBaselineRecovery(state: AgentState, attempt = 0): void {
+    if (this.states.get(state.agent) !== state) return;
+    if (!this.baselineIsStale(state)) return;
+    if (attempt === 0) {
+      if (state.recovering) return;
+      state.recovering = true;
+    }
+    if (attempt > BASELINE_RECOVERY_ATTEMPTS) {
+      state.recovering = false;
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (this.states.get(state.agent) !== state) return;
+      if (!this.baselineIsStale(state)) {
+        state.recovering = false;
+        return;
+      }
+      if (!this.resampleBaseline(state)) {
+        this.scheduleBaselineRecovery(state, attempt + 1);
+        return;
+      }
+      state.recovering = false;
+      this.reconcile(state);
+    }, attempt === 0 ? 0 : BASELINE_RECOVERY_INTERVAL_MS);
+    (timer as { unref?: () => void }).unref?.();
   }
 
   private queueBaselineRefresh(): void {
@@ -263,31 +539,20 @@ export class ToolPolicyRuntime {
   }
 
   private refreshAllBaselines(): void {
-    this.mutating = true;
-    try {
-      for (const state of this.states.values()) {
-        const preset = this.presetId(state.agent);
-        // A resample means dropping the live restriction first and re-applying
-        // it afterwards: two tools/change emissions per Agent per window. Only
-        // a state whose sample is missing or invalid needs that. Everything
-        // else is kept fresh by install() and adoptRequestSurface(), so an
-        // ordinary tools/change costs nothing here.
-        const needsSample = state.baseline.length === 0 || state.lastPreset !== preset;
-        if (!needsSample) continue;
-        state.lastPreset = preset;
-        state.restriction?.();
-        state.restriction = undefined;
-        state.lastDeny = undefined;
-        const nextSchemas = this.inheritedSchemas(state.agent);
-        const next = nextSchemas.map((schema) => schema.name);
-        state.baselineSchemas = nextSchemas;
-        if (!sameNames(state.baseline, next)) state.baseline = next;
-        this.observe(state);
-      }
-    } finally {
-      this.mutating = false;
+    const states = [...this.states.values()];
+    // A resample means dropping the live restriction first and re-applying it
+    // afterwards: two tools/change emissions per Agent per window. A stale state
+    // is replaced wholesale (a Preset switch may legitimately shrink the
+    // catalog); a fresh one only GROWS, because a baseline sampled before the
+    // Preset finished mounting is a strict subset of the real catalog and
+    // losing it would leave nothing to deny.
+    for (const state of states) {
+      if (this.states.get(state.agent) !== state) continue;
+      this.resampleBaseline(state, true);
     }
-    for (const state of this.states.values()) this.reconcile(state);
+    for (const state of states) {
+      if (this.states.get(state.agent) === state) this.reconcile(state);
+    }
   }
 
   private openGroup(agent: AgentLike, requestedGroup: string | undefined): ToolListResult {

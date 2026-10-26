@@ -36,6 +36,8 @@ export interface ToolSchemaLike {
 
 export interface ToolRuntimeLike {
   schemas(scope?: unknown): ToolSchemaLike[];
+  /** Resolve one visible tool without projecting the whole catalog. */
+  get?(name: string, scope?: unknown): unknown;
   register(definition: unknown): () => void;
   restrict(filter: { deny: string[] }): () => void;
   guard?(guard: (execution: { name: string }) => string | undefined): () => void;
